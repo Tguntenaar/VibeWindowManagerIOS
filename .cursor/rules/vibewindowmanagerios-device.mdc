@@ -1,0 +1,37 @@
+---
+description: >-
+  VibeWindowManagerIOS: run, install, and xcodebuild test on a physical iPhone
+  only; use iOS Simulator only for compile-only build (no test/run on sim).
+alwaysApply: true
+---
+
+# VibeWindowManager iOS run and test destinations
+
+This app is validated on a **connected physical iPhone** (the user’s real device), not the simulator, for **run** and **test**. Fast compile checks may use the simulator.
+
+## Do not
+
+- Do **not** use `xcodebuild test` or `xcodebuild` with a target that **runs** the app on an **iOS Simulator** as the default, unless the user clearly asks to use the simulator.
+- Do **not** default to a generic iPhone simulator name (e.g. iPhone 17) for `run` or `test`.
+
+## Run, install, `xcodebuild test`
+
+1. List destinations:  
+   `xcodebuild -project VibeWindowManagerIOS.xcodeproj -scheme VibeWindowManagerIOS -showdestinations`
+2. Choose a **physical device** line (`platform=iOS` and **not** `platform=iOS Simulator`), e.g.  
+   `-destination 'platform=iOS,name=Your iPhone,OS=18.x'`
+3. If **no** physical iPhone appears, **stop** and tell the user to connect the device, unlock it, and trust the computer; do not silently fall back to simulator.
+
+## Compile-only (allowed on simulator)
+
+For **build without running** or **typecheck** speed, you may use the simulator SDK only:
+
+```bash
+xcodebuild -project VibeWindowManagerIOS.xcodeproj -scheme VibeWindowManagerIOS -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' build
+```
+
+Do **not** add `-destination` simulator for `test` unless the user explicitly asked.
+
+## Optional
+
+- `xcrun devicectl list devices` or Xcode’s Devices and Simulators to confirm the device name and OS.
