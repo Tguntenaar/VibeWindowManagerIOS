@@ -12,7 +12,12 @@ struct BridgeLayoutMessage: Codable, Equatable {
     var seq: UInt64
     var appName: String?
     var bundleId: String?
+    /// Desktop-wide coordinate space (union of every Mac display's layout frame). All rects below
+    /// are normalized 0..1 top-left against this.
     var reference: BridgeRect
+    /// Per-physical-display rects normalized against `reference`. Optional: older servers omit it;
+    /// clients fall back to drawing just the reference outline.
+    var screens: [BridgeRect]?
     var windows: [BridgeWindow]
     var selectedId: String?
 }

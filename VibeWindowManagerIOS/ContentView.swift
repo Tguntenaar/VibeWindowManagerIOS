@@ -30,8 +30,14 @@ struct ContentView: View {
     @State private var lastSentAt: Date?
     @State private var lastSentRect: BridgeRect?
 
-    private static let liveSendInterval: TimeInterval = 1.0 / 30.0
+    /// Persists interpolation state across `TimelineView` ticks (class so mutations don’t replace `@State` identity).
+    @State private var mirrorSmootherBox = MirrorLayoutSmootherBox()
+
+    private static let liveSendIntervalIdle: TimeInterval = 1.0 / 30.0
+    private static let liveSendIntervalActive: TimeInterval = 1.0 / 60.0
     private static let swapMinOverlapFraction: Double = 0.05
+    /// When false, dragging A over B does nothing extra; B stays put.
+    private static let swapOnOverlapEnabled: Bool = false
 
     /// Full-screen remote mirror: hide the inline control stack so it cannot leave a transparent
     /// lower band (outlines would show through) or sit on top of window rects.
@@ -99,34 +105,86 @@ struct ContentView: View {
 
     @ViewBuilder
     private func windowOverlay(layout L: BridgeLayoutMessage) -> some View {
+        // Always render inside a single `TimelineView` branch so SwiftUI keeps one stable view
+        // identity for the gesture-bearing tiles. A previous `if frozenMap != nil { ... } else { TimelineView ... }`
+        // swap re-mounted the subtree on the first `beginMove` (because `frozenMap` flipped the
+        // branch), which orphaned the active `DragGesture` and killed the first drag every time.
+        // When `frozenMap != nil` the interpolator path inside `mirrorOverlayContent` is skipped,
+        // so the timeline tick is effectively free during drags.
+        TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { context in
+            mirrorOverlayContent(layout: L, animationNow: context.date)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea()
+        .onChange(of: L.seq) { _, _ in
+            if manipulatingWindowId == nil {
+                gestureDraft.removeAll()
+            }
+        }
+        .onChange(of: bridge.hasActiveLayoutSession) { _, active in
+            if !active {
+                mirrorSmootherBox.interpolator.reset()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func mirrorOverlayContent(layout L: BridgeLayoutMessage, animationNow: Date) -> some View {
         GeometryReader { proxy in
             let outerPad = max(14, min(proxy.size.width, proxy.size.height) * 0.02)
+            let frozen = frozenMap != nil
             let source = frozenWindows ?? L.windows
             let sorted = source.sorted { $0.zIndex < $1.zIndex }
+            let displayById: [String: BridgeRect]? = frozen
+                ? nil
+                : mirrorSmootherBox.interpolator.displayByWindowId(
+                    now: animationNow,
+                    layoutSeq: L.seq,
+                    windows: L.windows,
+                    manipulatingWindowId: manipulatingWindowId,
+                    gestureDraft: gestureDraft
+                )
             let vmap: MirrorViewportMap? = {
                 if let fm = frozenMap { return fm }
-                let merged: [BridgeWindow] = source.map { w in
-                    BridgeWindow(
+                let merged: [BridgeWindow] = L.windows.map { w in
+                    let r = displayById?[w.id] ?? w.rect
+                    return BridgeWindow(
                         id: w.id,
                         title: w.title,
                         zIndex: w.zIndex,
-                        rect: gestureDraft[w.id] ?? w.rect
+                        rect: gestureDraft[w.id] ?? r
                     )
                 }
                 return MirrorViewportMap.compute(
                     windows: merged,
+                    reference: L.reference,
                     containerWidth: proxy.size.width,
                     containerHeight: proxy.size.height,
                     outerPadding: outerPad
                 )
             }()
             if let vmap {
+                let refRect = vmap.referenceViewRect()
+                Rectangle()
+                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                    .frame(width: refRect.width, height: refRect.height)
+                    .position(x: refRect.midX, y: refRect.midY)
+                    .allowsHitTesting(false)
+                let screenRects = vmap.screenViewRects(L.screens ?? [])
+                ForEach(Array(screenRects.enumerated()), id: \.offset) { _, sr in
+                    Rectangle()
+                        .stroke(Color.white.opacity(0.55), lineWidth: 1.5)
+                        .frame(width: sr.width, height: sr.height)
+                        .position(x: sr.midX, y: sr.midY)
+                        .allowsHitTesting(false)
+                }
                 ForEach(sorted) { win in
                     let isGhost = (win.id == swapTargetId) && (originalARect != nil)
                     let effRect: BridgeRect = {
                         if let draft = gestureDraft[win.id] { return draft }
                         if isGhost, let orig = originalARect { return orig }
-                        return win.rect
+                        if frozen { return win.rect }
+                        return displayById?[win.id] ?? win.rect
                     }()
                     WindowMirrorOverlayTile(
                         windowId: win.id,
@@ -146,13 +204,6 @@ struct ContentView: View {
                 }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .ignoresSafeArea()
-        .onChange(of: L.seq) { _, _ in
-            if manipulatingWindowId == nil {
-                gestureDraft.removeAll()
-            }
-        }
     }
 
     // MARK: - Drag / resize flow
@@ -169,6 +220,10 @@ struct ContentView: View {
 
     private func moveChange(windowId: String, dxPt: CGFloat, dyPt: CGFloat) {
         guard let m = frozenMap, let base = originalARect else { return }
+        // 1:1 mapping between the iPad "Mac subset" and the real Mac desktop: finger travel in
+        // points ÷ scale ÷ referenceWidth = normalized delta. No gain multiplier — the represented
+        // subset on the iPad IS the coordinate space, so anything other than 1x makes the window
+        // run away from the finger.
         let (dxN, dyN) = m.normalizedTranslation(dx: dxPt, dy: dyPt)
         let newRect = BridgeRect(
             x: base.x + dxN,
@@ -177,15 +232,17 @@ struct ContentView: View {
             height: base.height
         )
         gestureDraft[windowId] = newRect
-        if let src = frozenWindows {
+        if Self.swapOnOverlapEnabled, let src = frozenWindows {
             swapTargetId = bestSwapTarget(for: newRect, draggedId: windowId, others: src)
+        } else {
+            swapTargetId = nil
         }
         throttledSend(windowId: windowId, rect: newRect)
     }
 
     private func endMove(windowId: String) {
         let finalRect = gestureDraft[windowId]
-        let swapId = swapTargetId
+        let swapId = Self.swapOnOverlapEnabled ? swapTargetId : nil
         let swapDest = originalARect
 
         if let r = finalRect {
@@ -234,11 +291,15 @@ struct ContentView: View {
         gestureDraft.removeValue(forKey: windowId)
         lastSentAt = nil
         lastSentRect = nil
+        mirrorSmootherBox.interpolator.reset()
     }
 
     private func throttledSend(windowId: String, rect: BridgeRect) {
         let now = Date()
-        if let last = lastSentAt, now.timeIntervalSince(last) < Self.liveSendInterval { return }
+        let minInterval = manipulatingWindowId == nil
+            ? Self.liveSendIntervalIdle
+            : Self.liveSendIntervalActive
+        if let last = lastSentAt, now.timeIntervalSince(last) < minInterval { return }
         if let prev = lastSentRect, Self.rectsEqual(prev, rect) { return }
         lastSentAt = now
         lastSentRect = rect
@@ -373,7 +434,7 @@ struct ContentView: View {
                 Button("Test paste: hi") { bridge.sendPaste("hi from iPhone\n") }
                 Button("STT end (test)") { bridge.sendTranscribeEndTest() }
             }
-            Text("Mirror: tap a window to focus on Mac. Long-press and drag to move; overlap another window to propose a swap that commits on release. Drag the corner handle to resize.")
+            Text("Mirror: tap a window to focus on Mac. Drag to move. Drag the corner handle to resize.")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             if let lastError = bridge.lastError {
@@ -409,13 +470,18 @@ struct ContentView: View {
     }
 }
 
+private final class MirrorLayoutSmootherBox {
+    var interpolator = MirrorLayoutInterpolator()
+}
+
 // MARK: - Mirror tile (tap / long-press move / corner resize)
 
 enum MirrorGestureConstants {
-    static let longPressSeconds: Double = 0.4
     static let minNormWidth: Double = 0.04
     static let minNormHeight: Double = 0.04
     static let handleSize: CGFloat = 26
+    /// Finger travel before a move gesture fires — leaves room for `onTapGesture` to win on taps.
+    static let moveMinDistance: CGFloat = 6
 }
 
 private struct WindowMirrorOverlayTile: View {
@@ -478,20 +544,18 @@ private struct WindowMirrorOverlayTile: View {
             .overlay(Circle().stroke(Color.white.opacity(0.9), lineWidth: 1))
     }
 
+    // Gestures run in `.global` so `translation` is measured in stable iPad-screen coordinates.
+    // With `.local` the tile's own `.position(center)` moves the gesture's coordinate space each
+    // frame, which makes `translation` drift back toward zero as the tile catches up to the finger
+    // and causes the "drag stalls after a few cm" / "two tiles flying apart" glitches.
     private var moveGesture: some Gesture {
-        LongPressGesture(minimumDuration: MirrorGestureConstants.longPressSeconds)
-            .sequenced(before: DragGesture())
-            .onChanged { value in
-                switch value {
-                case .second(true, let drag?):
-                    if !didBeginMove {
-                        didBeginMove = true
-                        onMoveBegin()
-                    }
-                    onMoveChange(drag.translation.width, drag.translation.height)
-                default:
-                    break
+        DragGesture(minimumDistance: MirrorGestureConstants.moveMinDistance, coordinateSpace: .global)
+            .onChanged { drag in
+                if !didBeginMove {
+                    didBeginMove = true
+                    onMoveBegin()
                 }
+                onMoveChange(drag.translation.width, drag.translation.height)
             }
             .onEnded { _ in
                 if didBeginMove {
@@ -502,7 +566,7 @@ private struct WindowMirrorOverlayTile: View {
     }
 
     private var resizeGesture: some Gesture {
-        DragGesture()
+        DragGesture(coordinateSpace: .global)
             .onChanged { v in
                 if !didBeginResize {
                     didBeginResize = true

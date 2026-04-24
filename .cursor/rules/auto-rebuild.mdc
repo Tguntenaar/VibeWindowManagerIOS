@@ -1,5 +1,5 @@
 ---
-description: Auto-rebuild and reinstall VibeWindowManagerIOS on the connected physical iPhone after code edits
+description: Auto-rebuild and reinstall VibeWindowManagerIOS on the connected physical iPad or iPhone after code edits
 alwaysApply: true
 globs:
   - "VibeWindowManagerIOS/**/*.swift"
@@ -8,9 +8,9 @@ globs:
   - "VibeWindowManagerIOS.xcodeproj/**"
 ---
 
-# Auto-rebuild rule (iOS, physical iPhone)
+# Auto-rebuild rule (iOS, physical iPad or iPhone)
 
-After any non-doc code change, rebuild and install on the connected physical iPhone. Do not fall back to an iPhone simulator silently. Skip for doc-only or `.cursor/**` changes.
+After any non-doc code change, rebuild and install on a connected physical device. Prefer iPad (this app is iPad-first); fall back to a connected iPhone. If neither is connected, STOP — do not target any simulator. The user starts simulators manually. Skip for doc-only or `.cursor/**` changes.
 
 This repo lives under a file-provider dir (`code.nosync`). Build to a derived-data path OUTSIDE that tree or codesign will fail with "resource fork, Finder information, or similar detritus not allowed".
 
@@ -18,12 +18,26 @@ Run from the repo root:
 
 ```bash
 DD="$HOME/Library/Developer/Xcode/DerivedData/VibeWMiOS-auto"
-UDID=$(xcrun devicectl list devices 2>/dev/null \
-  | awk '/iPhone/ && /connected/ {print $NF; exit}')
+
+# Extract a UUID-shaped UDID from `devicectl list devices` output.
+# `{print $NF}` no longer works — recent devicectl puts the product id (e.g. `(iPhone15,3)`)
+# in the last column, so we grep the UUID column by regex instead.
+pick_udid() {
+  local match="$1" # "ipad" or "iphone"
+  xcrun devicectl list devices 2>/dev/null \
+    | awk -v m="$match" 'tolower($0) ~ m && /connected/ {
+        for (i=1; i<=NF; i++)
+          if ($i ~ /^[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}$/) { print $i; exit }
+      }'
+}
+
+UDID=$(pick_udid ipad)
+if [ -z "$UDID" ]; then UDID=$(pick_udid iphone); fi
 if [ -z "$UDID" ]; then
-  echo "no physical iPhone connected - aborting auto-rebuild"
+  echo "no physical iPad or iPhone connected - aborting auto-rebuild (do NOT target a simulator)"
   exit 1
 fi
+echo "auto-rebuild target UDID=$UDID"
 
 xcodebuild -project VibeWindowManagerIOS.xcodeproj \
   -scheme VibeWindowManagerIOS -configuration Debug \
@@ -40,9 +54,12 @@ xcrun devicectl device process launch --device "$UDID" \
   com.thomasguntenaar.VibeWindowManagerIOS
 ```
 
+Note: `Debug-iphoneos` is correct for both iPad and iPhone device builds — it's the device platform folder, not an iPhone-specific one.
+
 Rules:
 - If build fails with "resource fork, Finder information, or similar detritus": confirm derivedDataPath is NOT under `code.nosync`. Never build to `./build` here.
+- If build fails because the device OS is older than the deployment target, stop and tell the user which device is too old — do not silently pick another destination.
 - If build fails for other reasons, print the first real error and stop. Do not retry blindly.
-- Do not target a simulator. If no physical iPhone is connected, stop and tell the user.
+- Do NOT target a simulator. If no physical iPad or iPhone is connected, stop and tell the user. The user will start simulators manually when needed.
 - Do not open Xcode.
 - Do not run this for doc-only, README, or `.cursor/**` edits.
