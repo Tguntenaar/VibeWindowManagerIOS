@@ -43,3 +43,12 @@ struct BridgeErrorMessage: Codable {
     var type: String
     var message: String
 }
+
+struct BridgeTmuxPaneMessage: Codable {
+    var type: String
+    var seq: UInt64
+    var text: String
+    var error: String?
+    /// True if server clipped (line/byte cap).
+    var truncated: Bool
+}

@@ -400,14 +400,15 @@
 				DEVELOPMENT_TEAM = Q9DB75DV7G;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSBonjourServices = _vibewm._tcp;
+				INFOPLIST_FILE = "$(SRCROOT)/Info-Plist-ATS.plist";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Connect to VibeWindowManager on your Mac to mirror window layout.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Send voice to the Mac for terminal typing (push-to-talk).";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Show live on-device text while you hold the mic. The Mac still receives audio for its own transcription and paste.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.3;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -436,14 +437,15 @@
 				DEVELOPMENT_TEAM = Q9DB75DV7G;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSBonjourServices = _vibewm._tcp;
+				INFOPLIST_FILE = "$(SRCROOT)/Info-Plist-ATS.plist";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Connect to VibeWindowManager on your Mac to mirror window layout.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Send voice to the Mac for terminal typing (push-to-talk).";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Show live on-device text while you hold the mic. The Mac still receives audio for its own transcription and paste.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.3;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

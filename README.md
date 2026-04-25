@@ -5,22 +5,23 @@
 ## What you get
 
 - Full-screen **layout mirror** (black background, per-window outlines) when connected.
-- **Bridge settings** (gear): discovery, connect, and debug actions in a sheet so the mirror is not covered by setup UI.
-- **Three ways to connect** (see below): Tailnet, Bonjour, or manual address.
+- **Bridge settings** (gear): connect and debug actions in a sheet so the mirror is not covered by setup UI.
+- **Two ways to connect** (see below): Tailnet hostname or manual `host:port` / `ws://` URL.
+- **Tmux buffer** (toolbar text icon when mirroring): read scrollback/visible text from a tmux pane on the Mac (`requestTmuxPane` / `tmuxPane` in the protocol). Configure the **tmux target** on the Mac; see the [macOS README](https://github.com/Tguntenaar/VibeWindowManager#tmux-buffer-on-ipad-optional).
 
 ## Requirements
 
 - **Xcode** with an iOS SDK matching this project’s deployment target (see the Xcode project settings).
 - A Mac running **VibeWindowManager** with the **bridge** enabled; see the [macOS README](https://github.com/Tguntenaar/VibeWindowManager#quick-start-bridge--ios).
-- On the device: **local network** permission when iOS asks, so Bonjour and LAN WebSockets can work.
+- On the device: **local network** permission when iOS asks, so WebSockets to your Mac (LAN or tailnet addresses) can work.
+- The app uses **`ws://` (cleartext)** to your Mac; the target merges `Info-Plist-ATS.plist` with `NSAppTransportSecurity` / `NSAllowsArbitraryLoads` so iOS does not block those URLs. For App Store review, you may need to document this or narrow exceptions later.
 
-## Connect to your Mac (order of attempts)
+## Connect to your Mac
 
-1. **Tailnet** — Enter your Mac’s **Tailscale MagicDNS** hostname (e.g. `my-mac.tail…ts.net` or the short name). The app opens `ws://<host>:19842/bridge` and falls back to Bonjour after a short wait if no layout arrives. **Tailscale** must run on the iPhone and the Mac, with **MagicDNS** available on the phone.
-2. **Bonjour** — Browses `_vibewm._tcp` and lists Macs on the same LAN; tap one to connect.
-3. **Manual** — Enter `IP:port` (default port `19842`; the client adds the `/bridge` path).
+1. **Tailnet** — Enter your Mac’s **Tailscale MagicDNS** hostname (e.g. `my-mac.tail…ts.net`). The app opens `ws://<host>:19842/bridge` (override with `host:port` in the field if needed). **Tailscale** must run on the iPhone and the Mac, with **MagicDNS** resolving the hostname on the phone. A **Connect via Tailnet** attempt times out after a few seconds if no `layout` arrives.
+2. **Manual** — Enter `IP:port` (default port `19842` on the Mac; the client adds the `/bridge` path unless you pass a full `ws://` URL). Use your tailnet `100.x.x.x` or LAN `192.168.x.x` as needed.
 
-The Mac app’s bridge UI shows a **Copy** action for the Tailnet hostname when the Tailscale CLI is available. **Tailnet is optional**; same-Wi‑Fi **Bonjour** is enough for many setups.
+The Mac app’s bridge UI may show a **Copy** action for the Tailnet hostname when the Tailscale CLI is available.
 
 ## Documentation (shared with the Mac repo)
 

@@ -4,15 +4,14 @@
 //
 
 import SwiftUI
-#if canImport(UIKit)
 import UIKit
-#endif
 
 struct ContentView: View {
     @Environment(\.openURL) private var openURL
     @StateObject private var bridge = BridgeClient()
     @AppStorage("bridgeHostPort") private var hostPort: String = ""
     @State private var showingBridgeSettings = false
+    @State private var showingTmuxPane = false
 
     /// Local preview rects during drag/resize; cleared when server sends a new `layout.seq` (unless manipulating).
     @State private var gestureDraft: [String: BridgeRect] = [:]
@@ -32,6 +31,8 @@ struct ContentView: View {
 
     /// Persists interpolation state across `TimelineView` ticks (class so mutations don’t replace `@State` identity).
     @State private var mirrorSmootherBox = MirrorLayoutSmootherBox()
+
+    @StateObject private var holdToSpeak = HoldToSpeakRecorder()
 
     private static let liveSendIntervalIdle: TimeInterval = 1.0 / 30.0
     private static let liveSendIntervalActive: TimeInterval = 1.0 / 60.0
@@ -54,40 +55,71 @@ struct ContentView: View {
                 windowOverlay(layout: L)
                     .zIndex(0)
             } else {
-                Text(bridge.status)
-                    .foregroundStyle(.secondary)
+                Color.clear
                     .zIndex(0)
             }
 
             if isMirroring {
+                VStack(alignment: .center, spacing: 0) {
+                    mirrorTranscribeStatusBanner
+                        .padding(.top, 6)
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .zIndex(2)
+                .allowsHitTesting(false)
                 HStack {
                     Spacer()
-                    Button {
-                        showingBridgeSettings = true
-                    } label: {
-                        Image(systemName: "gearshape.fill")
-                            .font(.title2)
-                            .foregroundStyle(.white.opacity(0.85))
-                            .padding(12)
-                            .contentShape(Rectangle())
+                    HStack(spacing: 0) {
+                        Button {
+                            showingTmuxPane = true
+                        } label: {
+                            Image(systemName: "text.alignleft")
+                                .font(.title2)
+                                .foregroundStyle(.white.opacity(0.85))
+                                .padding(12)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("Tmux buffer")
+                        Button {
+                            showingBridgeSettings = true
+                        } label: {
+                            Image(systemName: "gearshape.fill")
+                                .font(.title2)
+                                .foregroundStyle(.white.opacity(0.85))
+                                .padding(12)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("Bridge settings")
                     }
-                    .accessibilityLabel("Bridge settings")
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                .zIndex(1)
+                .zIndex(3)
+                HStack {
+                    Spacer()
+                    MirrorGlobalMicButton(
+                        isRecording: holdToSpeak.isRunning,
+                        hasSelectedWindow: (bridge.layout?.selectedId).map { !$0.isEmpty } ?? false,
+                        onRecordDown: {
+                            guard let sid = bridge.layout?.selectedId, !sid.isEmpty else { return }
+                            bridge.clearTranscribePreview()
+                            holdToSpeak.start(bridge: bridge)
+                        },
+                        onRecordUp: { holdToSpeak.stop() }
+                    )
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                .padding([.trailing, .bottom])
+                .zIndex(3)
             } else {
-                bridgeControlPanel
-                    .padding()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .background(Color.black)
+                BridgeConnectionView(bridge: bridge, hostPort: $hostPort, openAppSettings: openAppSettings)
+                    .preferredColorScheme(.dark)
                     .zIndex(1)
             }
         }
         .sheet(isPresented: $showingBridgeSettings) {
             NavigationStack {
-                bridgeControlPanel
-                    .padding()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                BridgeConnectionView(bridge: bridge, hostPort: $hostPort, openAppSettings: openAppSettings)
                     .navigationTitle("Bridge")
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
@@ -96,10 +128,10 @@ struct ContentView: View {
                         }
                     }
             }
+            .preferredColorScheme(.dark)
         }
-        .onAppear {
-            bridge.startBrowsing()
-            bridge.enableAutoConnect()
+        .sheet(isPresented: $showingTmuxPane) {
+            tmuxPaneSheet
         }
     }
 
@@ -192,6 +224,9 @@ struct ContentView: View {
                         isGhost: isGhost,
                         selected: win.id == (L.selectedId ?? ""),
                         map: vmap,
+                        focusedTmux: (win.id == (L.selectedId ?? ""))
+                            ? (text: bridge.tmuxPaneText, error: bridge.tmuxPaneError)
+                            : nil,
                         onTap: { bridge.sendSelect(windowId: win.id) },
                         onMoveBegin: { beginMove(windowId: win.id, map: vmap, source: source) },
                         onMoveChange: { dx, dy in moveChange(windowId: win.id, dxPt: dx, dyPt: dy) },
@@ -336,128 +371,139 @@ struct ContentView: View {
             && abs(a.height - b.height) < 1e-6
     }
 
-    @ViewBuilder
-    private var bridgeControlPanel: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(bridge.status)
-                .font(.caption.monospaced())
-                .padding(8)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
-            if let currentTarget = bridge.currentTarget {
-                Text("Target: \(currentTarget)")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
-            }
-            if !bridge.lastActionNote.isEmpty {
-                Text(bridge.lastActionNote)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
+    private var tmuxPaneSheet: some View {
+        NavigationStack {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Button("Refresh discovery") { bridge.startBrowsing(userInitiated: true) }
-                    Button("Auto-connect now") { bridge.autoConnectNow() }
-                    Button("iOS app settings") { openAppSettings() }
-                }
-                HStack {
-                    Text("Auto-connect: \(bridge.isAutoConnectEnabled ? "on" : "off")")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Text("Discovered Macs: \(bridge.discoveredServices.count)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    if bridge.isAttemptingTailnet {
-                        Text("Tailnet attempt…")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.orange)
+                    Button("Refresh") {
+                        bridge.sendRequestTmuxPane()
+                    }
+                    .buttonStyle(.bordered)
+                    Toggle("Auto (2s)", isOn: Binding(
+                        get: { bridge.isTmuxAutoRefreshEnabled },
+                        set: { bridge.setTmuxAutoRefresh($0) }
+                    ))
+                    if bridge.isTmuxAutoLoopRunning {
+                        ProgressView()
+                            .scaleEffect(0.8)
                     }
                 }
-            }
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Tailnet (tried first on auto-connect; falls back to Bonjour)")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                HStack {
-                    TextField("Mac Tailnet hostname (e.g. my-mac.tailxxxx.ts.net)", text: $bridge.preferredTailnetHost)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .textFieldStyle(.roundedBorder)
-                    Button("Connect via Tailnet") {
-                        bridge.connectTailnet(host: bridge.preferredTailnetHost)
-                    }
-                    .disabled(bridge.preferredTailnetHost.trimmingCharacters(in: .whitespaces).isEmpty)
+                if let e = bridge.tmuxPaneError, !e.isEmpty {
+                    Text(e)
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
-                Text("Requires Tailscale running on iPhone (with MagicDNS) and on the Mac. Leave blank to stay on Bonjour-only.")
-                    .font(.caption2)
+                if bridge.tmuxPaneTruncated {
+                    Text("Output truncated (line/byte cap on Mac).")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Text("seq \(bridge.tmuxPaneSeq)")
+                    .font(.caption2.monospaced())
                     .foregroundStyle(.tertiary)
-            }
-            if !bridge.discoveredServices.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Nearby Macs")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    ForEach(bridge.discoveredServices) { service in
-                        Button {
-                            hostPort = service.hostPort
-                            bridge.connect(discovered: service)
-                        } label: {
-                            HStack {
-                                Text(service.name)
-                                Spacer()
-                                Text(service.hostPort)
-                                    .font(.caption.monospaced())
-                                    .foregroundStyle(.secondary)
-                            }
+                ScrollView(.vertical, showsIndicators: true) {
+                    Group {
+                        if !bridge.tmuxPaneText.isEmpty {
+                            Text(bridge.tmuxPaneText)
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundStyle(.primary)
+                                .multilineTextAlignment(.leading)
+                                .textSelection(.enabled)
+                        } else if let e = bridge.tmuxPaneError, !e.isEmpty {
+                            Text("No pane text returned. See the error above.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text(tmuxEmptyStateHint)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.leading)
                         }
-                        .buttonStyle(.bordered)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    // Required so multiline text expands the scrollable content size (otherwise height ~0).
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(12)
                 }
-            } else {
-                Text("If nothing shows up: make sure the Mac bridge is on, both devices are on the same LAN, and this app has Local Network permission. Use iOS app settings if iOS already denied it.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                .scrollIndicators(.visible, axes: .vertical)
+                .frame(maxWidth: .infinity, minHeight: 220)
+                .background(Color(UIColor.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
-            Text("Manual connect: on the Mac, start the bridge, then use your Mac’s LAN address with port 19842 (e.g. 192.168.x.x:19842). Check Mac → System Settings → Network, or in Terminal: ipconfig getifaddr en0")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            HStack {
-                TextField("Mac host:port", text: $hostPort)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 220)
-                Button("Connect") { bridge.connect(hostOrURL: hostPort) }
-                Button("Disconnect") { bridge.disconnect() }
+            .padding()
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(Color(UIColor.systemBackground))
+            .navigationTitle("tmux buffer")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { showingTmuxPane = false }
+                }
             }
-            HStack {
-                Button("Next window") { bridge.sendSelectNext() }
-                Button("Test paste: hi") { bridge.sendPaste("hi from iPhone\n") }
-                Button("STT end (test)") { bridge.sendTranscribeEndTest() }
+            .onAppear {
+                bridge.sendRequestTmuxPane()
             }
-            Text("Mirror: tap a window to focus on Mac. Drag to move. Drag the corner handle to resize.")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            if let lastError = bridge.lastError {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Connection / discovery error")
-                        .font(.caption.weight(.semibold))
-                    Text(lastError)
-                        .font(.caption2.monospaced())
+        }
+    }
+
+    private var tmuxEmptyStateHint: String {
+        "Tap Refresh — set the tmux target on the Mac, and run your shell inside tmux (see Mac README)."
+    }
+
+    /// Shown in mirror mode only (the settings `bridgeControlPanel` is hidden in full mirror).
+    @ViewBuilder
+    private var mirrorTranscribeStatusBanner: some View {
+        if holdToSpeak.isRunning
+            || bridge.transcribeInFlight
+            || !bridge.transcribeLast.isEmpty
+            || !(bridge.transcribeError?.isEmpty ?? true)
+        {
+            VStack(alignment: .leading, spacing: 8) {
+                if holdToSpeak.isRunning {
+                    if !holdToSpeak.liveTranscript.isEmpty {
+                        Text(holdToSpeak.liveTranscript)
+                            .font(.subheadline)
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    } else {
+                        Text("Listening…")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                    }
+                    Text("On-device live preview. The Mac still runs Whisper and pastes after you release.")
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.55))
+                }
+                if bridge.transcribeInFlight {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                            .tint(.white)
+                        Text("Transcribing on Mac…")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if !holdToSpeak.isRunning, !bridge.transcribeInFlight, let err = bridge.transcribeError, !err.isEmpty {
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(Color(red: 1, green: 0.4, blue: 0.42))
+                } else if !holdToSpeak.isRunning, !bridge.transcribeInFlight, !bridge.transcribeLast.isEmpty {
+                    Text(bridge.transcribeLast)
+                        .font(.subheadline)
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
-                    Button("Clear error") { bridge.clearError() }
                 }
-                .padding(10)
-                .background(Color.red.opacity(0.16), in: RoundedRectangle(cornerRadius: 10))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10)
-                        .stroke(Color.red.opacity(0.55), lineWidth: 1)
-                )
             }
-            if !bridge.transcribeLast.isEmpty || bridge.transcribeError != nil {
-                Text(bridge.transcribeLast + (bridge.transcribeError.map { " (\($0))" } ?? ""))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
+            .frame(maxWidth: 560)
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(.ultraThinMaterial)
+            )
         }
     }
 
@@ -480,8 +526,102 @@ enum MirrorGestureConstants {
     static let minNormWidth: Double = 0.04
     static let minNormHeight: Double = 0.04
     static let handleSize: CGFloat = 26
+    /// Full-screen mirror record control (hold-to-speak); not tied to resize handle size.
+    static let globalMicButtonSize: CGFloat = handleSize * 5
     /// Finger travel before a move gesture fires — leaves room for `onTapGesture` to win on taps.
     static let moveMinDistance: CGFloat = 6
+    /// Inset from tile edges for the in-tile tmux readout, leaving the resize handle (bottom-trailing) clear.
+    static let tmuxReadoutHandleMargin: CGFloat = 10
+}
+
+/// Live tmux readout for the one **focused** window tile (matches `selectedId` on the Mac).
+/// One-finger move is implemented by `TwoFingerScrollTextView`’s back `UIPan`; 2-finger scroll is the `UITextView`.
+private struct TmuxTileReadout: View {
+    var text: String
+    var error: String?
+    var maxWidth: CGFloat
+    var maxHeight: CGFloat
+    var onMoveBegin: () -> Void
+    var onMoveChange: (CGFloat, CGFloat) -> Void
+    var onMoveEnd: () -> Void
+
+    private var displayText: String {
+        if text.isEmpty {
+            "No buffer yet — use the side menu: Refresh or Auto (2s)."
+        } else {
+            text
+        }
+    }
+
+    private var tmuxTextUIColor: UIColor {
+        if text.isEmpty { UIColor(white: 1, alpha: 0.45) }
+        else { UIColor(red: 0.75, green: 0.95, blue: 0.8, alpha: 1) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let e = error, !e.isEmpty {
+                Text(e)
+                    .font(.system(size: 9, weight: .medium, design: .default))
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+                    .allowsHitTesting(false)
+            }
+            TwoFingerScrollTextView(
+                text: displayText,
+                textColor: tmuxTextUIColor,
+                font: UIFont.monospacedSystemFont(ofSize: 9, weight: .regular),
+                scrollToBottomOnTextChange: true,
+                onMoveBegin: onMoveBegin,
+                onMoveChange: onMoveChange,
+                onMoveEnd: onMoveEnd
+            )
+            .frame(maxWidth: .infinity, minHeight: 64, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .padding(6)
+        .frame(width: maxWidth, height: maxHeight, alignment: .topLeading)
+        .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+    }
+}
+
+/// Full-screen hold-to-speak: targets the Mac window already selected in the layout (tap a tile first).
+private struct MirrorGlobalMicButton: View {
+    let isRecording: Bool
+    let hasSelectedWindow: Bool
+    var onRecordDown: () -> Void
+    var onRecordUp: () -> Void
+
+    @State private var isHoldOnMic = false
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(isRecording ? Color.red.opacity(0.7) : Color.cyan.opacity(0.4))
+            Image(systemName: isRecording ? "mic.fill" : "mic")
+                .font(.system(size: 12 * 5, weight: .semibold))
+                .foregroundStyle(.white)
+        }
+        .opacity(hasSelectedWindow ? 1 : 0.35)
+        .frame(width: MirrorGestureConstants.globalMicButtonSize, height: MirrorGestureConstants.globalMicButtonSize)
+        .contentShape(Circle())
+        .accessibilityLabel("Hold to speak to selected window")
+        .highPriorityGesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .local)
+                .onChanged { _ in
+                    guard hasSelectedWindow else { return }
+                    if !isHoldOnMic {
+                        isHoldOnMic = true
+                        onRecordDown()
+                    }
+                }
+                .onEnded { _ in
+                    if isHoldOnMic {
+                        isHoldOnMic = false
+                        onRecordUp()
+                    }
+                }
+        )
+    }
 }
 
 private struct WindowMirrorOverlayTile: View {
@@ -491,6 +631,8 @@ private struct WindowMirrorOverlayTile: View {
     let isGhost: Bool
     let selected: Bool
     let map: MirrorViewportMap
+    /// Tmux text/error only for the Mac **focused** window (`selectedId`); `nil` on other tiles.
+    let focusedTmux: (text: String, error: String?)?
     var onTap: () -> Void
     var onMoveBegin: () -> Void
     var onMoveChange: (CGFloat, CGFloat) -> Void
@@ -513,8 +655,22 @@ private struct WindowMirrorOverlayTile: View {
             ? Color.white.opacity(0.9)
             : Color.white.opacity(selected ? 1 : 0.75)
 
-        RoundedRectangle(cornerRadius: 6, style: .continuous)
+        let tileFace = RoundedRectangle(cornerRadius: 6, style: .continuous)
             .fill(Color.white.opacity(fillOpacity))
+            .overlay(alignment: .topLeading) {
+                if let ft = focusedTmux, !isGhost {
+                    let m = MirrorGestureConstants.handleSize + MirrorGestureConstants.tmuxReadoutHandleMargin
+                    TmuxTileReadout(
+                        text: ft.text,
+                        error: ft.error,
+                        maxWidth: size.width - m,
+                        maxHeight: size.height - m,
+                        onMoveBegin: onMoveBegin,
+                        onMoveChange: onMoveChange,
+                        onMoveEnd: onMoveEnd
+                    )
+                }
+            }
             .overlay(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .stroke(strokeColor, style: strokeStyle)
@@ -524,8 +680,8 @@ private struct WindowMirrorOverlayTile: View {
                     resizeHandle
                         .frame(width: MirrorGestureConstants.handleSize, height: MirrorGestureConstants.handleSize)
                         .contentShape(Circle())
-                        .padding(4)
                         .highPriorityGesture(resizeGesture)
+                        .padding(4)
                 }
             }
             .frame(width: size.width, height: size.height)
@@ -533,9 +689,16 @@ private struct WindowMirrorOverlayTile: View {
             .onTapGesture {
                 if !isGhost { onTap() }
             }
-            .gesture(moveGesture)
-            .position(center)
-            .allowsHitTesting(!isGhost)
+        // `TwoFingerScrollTextView` implements 1-finger move over the readout; avoid a second `moveGesture` (double `moveChange`).
+        Group {
+            if focusedTmux == nil {
+                tileFace.gesture(moveGesture)
+            } else {
+                tileFace
+            }
+        }
+        .position(center)
+        .allowsHitTesting(!isGhost)
     }
 
     private var resizeHandle: some View {
