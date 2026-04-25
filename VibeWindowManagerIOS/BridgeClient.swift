@@ -11,6 +11,13 @@ import Foundation
 @MainActor
 final class BridgeClient: ObservableObject {
     @Published var layout: BridgeLayoutMessage?
+    /// Running apps the Mac can mirror (from `mirrorAppList`); use to switch target from the iPad.
+    @Published var mirrorAppList: [BridgeMirrorAppEntry] = []
+    @Published var mirrorAppListSeq: UInt64 = 0
+    /// Per-window live JPEG (Mac `screencapture` + downscale) when the client has enabled the stream.
+    @Published var windowStreamJpegById: [String: Data] = [:]
+    @Published var windowStreamErrorById: [String: String] = [:]
+    @Published private(set) var windowStreamToMacIsOn: Bool = false
     @Published var status: String = "Not connected"
     /// Last button-driven action, for quick confirmation something ran.
     @Published private(set) var lastActionNote: String = ""
@@ -110,6 +117,11 @@ final class BridgeClient: ObservableObject {
         session?.invalidateAndCancel()
         session = nil
         layout = nil
+        mirrorAppList = []
+        mirrorAppListSeq = 0
+        windowStreamJpegById = [:]
+        windowStreamErrorById = [:]
+        windowStreamToMacIsOn = false
         hasActiveLayoutSession = false
         currentTarget = nil
         tmuxPaneText = ""
@@ -399,6 +411,21 @@ final class BridgeClient: ObservableObject {
             }
         case "pong", "serverHello":
             break
+        case "mirrorAppList":
+            if let m = try? decoder.decode(BridgeMirrorAppListMessage.self, from: data) {
+                mirrorAppListSeq = m.seq
+                mirrorAppList = m.apps
+            }
+        case "windowStream":
+            if let m = try? decoder.decode(BridgeWindowStreamMessage.self, from: data) {
+                if let b64 = m.base64, let raw = Data(base64Encoded: b64) {
+                    windowStreamJpegById[m.windowId] = raw
+                    windowStreamErrorById[m.windowId] = nil
+                } else if let e = m.error, !e.isEmpty {
+                    windowStreamJpegById.removeValue(forKey: m.windowId)
+                    windowStreamErrorById[m.windowId] = e
+                }
+            }
         default:
             break
         }
@@ -406,6 +433,24 @@ final class BridgeClient: ObservableObject {
 
     func sendSelect(windowId: String) {
         sendEncodable(ClientSelect(windowId: windowId))
+    }
+
+    /// Switch which Mac app is mirrored (same as the “Mirror app” row on the Mac). Uses `bundleId` from `mirrorAppList`.
+    func sendSetMirrorAppQuery(bundleId: String) {
+        let id = bundleId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return }
+        sendEncodable(ClientSetMirrorAppQuery(bundleId: id))
+        noteAction("Mirror app: \(id)")
+    }
+
+    /// Tells the Mac to start/stop per-window JPEG screen capture. Turn off in “tmux text” tile mode to save CPU.
+    func setWindowStreamToMacEnabled(_ enabled: Bool) {
+        windowStreamToMacIsOn = enabled
+        if !enabled {
+            windowStreamJpegById = [:]
+            windowStreamErrorById = [:]
+        }
+        sendEncodable(ClientSetWindowStreamEnabled(enabled: enabled))
     }
 
     func sendSetWindowRect(windowId: String, rect: BridgeRect) {
@@ -475,6 +520,11 @@ final class BridgeClient: ObservableObject {
         session?.invalidateAndCancel()
         session = nil
         layout = nil
+        mirrorAppList = []
+        mirrorAppListSeq = 0
+        windowStreamJpegById = [:]
+        windowStreamErrorById = [:]
+        windowStreamToMacIsOn = false
         hasActiveLayoutSession = false
         tmuxPaneText = ""
         tmuxPaneError = nil
@@ -550,6 +600,16 @@ struct ClientTranscribeLive: Encodable {
 struct ClientRequestTmuxPane: Encodable {
     var type: String = "requestTmuxPane"
     var lines: Int?
+}
+
+struct ClientSetMirrorAppQuery: Encodable {
+    var type: String = "setMirrorAppQuery"
+    var bundleId: String
+}
+
+struct ClientSetWindowStreamEnabled: Encodable {
+    var type: String = "setWindowStreamEnabled"
+    var enabled: Bool
 }
 
 extension BridgeClient {

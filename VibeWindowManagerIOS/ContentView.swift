@@ -6,12 +6,21 @@
 import SwiftUI
 import UIKit
 
+/// In-tile readout: live JPEG from the Mac (`screencapture` stream) or tmux text for the selected tile.
+private enum MirrorTileReadout: Equatable {
+    case tmux(String, String?)
+    case screen(Data?, String?)
+}
+
 struct ContentView: View {
     @Environment(\.openURL) private var openURL
     @StateObject private var bridge = BridgeClient()
     @AppStorage("bridgeHostPort") private var hostPort: String = ""
+    /// `false` = live per-window screen capture on tiles (VNC-style); `true` = tmux text on the **selected** tile (terminals / Ghostty).
+    @AppStorage("mirrorTmuxTextTiles") private var mirrorTmuxTextTiles: Bool = false
     @State private var showingBridgeSettings = false
     @State private var showingTmuxPane = false
+    @State private var showingMirrorAppPicker = false
 
     /// Local preview rects during drag/resize; cleared when server sends a new `layout.seq` (unless manipulating).
     @State private var gestureDraft: [String: BridgeRect] = [:]
@@ -72,15 +81,35 @@ struct ContentView: View {
                     Spacer()
                     HStack(spacing: 0) {
                         Button {
-                            showingTmuxPane = true
+                            showingMirrorAppPicker = true
                         } label: {
-                            Image(systemName: "text.alignleft")
+                            Image(systemName: "square.grid.2x2")
                                 .font(.title2)
                                 .foregroundStyle(.white.opacity(0.85))
                                 .padding(12)
                                 .contentShape(Rectangle())
                         }
-                        .accessibilityLabel("Tmux buffer")
+                        .accessibilityLabel("Choose mirror app")
+                        Button {
+                            mirrorTmuxTextTiles.toggle()
+                        } label: {
+                            Image(systemName: mirrorTmuxTextTiles ? "text.alignleft" : "play.rectangle.fill")
+                                .font(.title2)
+                                .foregroundStyle(.white.opacity(0.85))
+                                .padding(12)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("Tile readout: live screen, or tmux text")
+                        Button {
+                            showingTmuxPane = true
+                        } label: {
+                            Image(systemName: "list.bullet.rectangle.portrait")
+                                .font(.title2)
+                                .foregroundStyle(.white.opacity(0.85))
+                                .padding(12)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("Tmux buffer (full scrollback sheet)")
                         Button {
                             showingBridgeSettings = true
                         } label: {
@@ -133,6 +162,34 @@ struct ContentView: View {
         .sheet(isPresented: $showingTmuxPane) {
             tmuxPaneSheet
         }
+        .overlay {
+            if showingMirrorAppPicker, isMirroring {
+                MirrorAppPickerOverlay(
+                    apps: bridge.mirrorAppList,
+                    currentBundleId: bridge.layout?.bundleId,
+                    onPick: { bundleId in
+                        bridge.sendSetMirrorAppQuery(bundleId: bundleId)
+                        showingMirrorAppPicker = false
+                    },
+                    onDismiss: { showingMirrorAppPicker = false }
+                )
+                .zIndex(20)
+            }
+        }
+        .onChange(of: isMirroring) { _, on in
+            if on { syncWindowStreamToMac() } else { bridge.setWindowStreamToMacEnabled(false) }
+        }
+        .onChange(of: bridge.hasActiveLayoutSession) { _, on in
+            if on { syncWindowStreamToMac() }
+        }
+        .onChange(of: mirrorTmuxTextTiles) { _, _ in
+            if isMirroring { syncWindowStreamToMac() }
+        }
+    }
+
+    private func syncWindowStreamToMac() {
+        guard isMirroring else { return }
+        bridge.setWindowStreamToMacEnabled(!mirrorTmuxTextTiles)
     }
 
     @ViewBuilder
@@ -224,9 +281,7 @@ struct ContentView: View {
                         isGhost: isGhost,
                         selected: win.id == (L.selectedId ?? ""),
                         map: vmap,
-                        focusedTmux: (win.id == (L.selectedId ?? ""))
-                            ? (text: bridge.tmuxPaneText, error: bridge.tmuxPaneError)
-                            : nil,
+                        readout: tileReadout(layout: L, for: win),
                         onTap: { bridge.sendSelect(windowId: win.id) },
                         onMoveBegin: { beginMove(windowId: win.id, map: vmap, source: source) },
                         onMoveChange: { dx, dy in moveChange(windowId: win.id, dxPt: dx, dyPt: dy) },
@@ -514,6 +569,14 @@ struct ContentView: View {
         }
 #endif
     }
+
+    private func tileReadout(layout L: BridgeLayoutMessage, for win: BridgeWindow) -> MirrorTileReadout? {
+        if mirrorTmuxTextTiles {
+            guard win.id == (L.selectedId ?? "") else { return nil }
+            return .tmux(bridge.tmuxPaneText, bridge.tmuxPaneError)
+        }
+        return .screen(bridge.windowStreamJpegById[win.id], bridge.windowStreamErrorById[win.id])
+    }
 }
 
 private final class MirrorLayoutSmootherBox {
@@ -532,6 +595,67 @@ enum MirrorGestureConstants {
     static let moveMinDistance: CGFloat = 6
     /// Inset from tile edges for the in-tile tmux readout, leaving the resize handle (bottom-trailing) clear.
     static let tmuxReadoutHandleMargin: CGFloat = 10
+}
+
+/// Live Mac window image (VNC-style over the bridge). One-finger move matches tile drag (global coords).
+private struct WindowStreamTileReadout: View {
+    var imageData: Data?
+    var error: String?
+    var maxWidth: CGFloat
+    var maxHeight: CGFloat
+    var onMoveBegin: () -> Void
+    var onMoveChange: (CGFloat, CGFloat) -> Void
+    var onMoveEnd: () -> Void
+
+    @State private var didBeginMove = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let e = error, !e.isEmpty {
+                Text(e)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.red)
+                    .lineLimit(3)
+            }
+            ZStack {
+                Color.black
+                if let d = imageData, let img = UIImage(data: d) {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    Text(
+                        "Waiting for live screen…\n(Grant Screen Recording to VibeWindowManager on the Mac if prompted.)"
+                    )
+                    .font(.system(size: 9, weight: .regular))
+                    .foregroundStyle(Color.white.opacity(0.5))
+                    .multilineTextAlignment(.center)
+                    .padding(6)
+                }
+            }
+        }
+        .padding(4)
+        .frame(width: maxWidth, height: maxHeight, alignment: .topLeading)
+        .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        .highPriorityGesture(
+            DragGesture(minimumDistance: MirrorGestureConstants.moveMinDistance, coordinateSpace: .global)
+                .onChanged { drag in
+                    if !didBeginMove {
+                        didBeginMove = true
+                        onMoveBegin()
+                    }
+                    onMoveChange(drag.translation.width, drag.translation.height)
+                }
+                .onEnded { _ in
+                    if didBeginMove {
+                        didBeginMove = false
+                        onMoveEnd()
+                    }
+                }
+        )
+    }
 }
 
 /// Live tmux readout for the one **focused** window tile (matches `selectedId` on the Mac).
@@ -631,8 +755,7 @@ private struct WindowMirrorOverlayTile: View {
     let isGhost: Bool
     let selected: Bool
     let map: MirrorViewportMap
-    /// Tmux text/error only for the Mac **focused** window (`selectedId`); `nil` on other tiles.
-    let focusedTmux: (text: String, error: String?)?
+    let readout: MirrorTileReadout?
     var onTap: () -> Void
     var onMoveBegin: () -> Void
     var onMoveChange: (CGFloat, CGFloat) -> Void
@@ -658,17 +781,32 @@ private struct WindowMirrorOverlayTile: View {
         let tileFace = RoundedRectangle(cornerRadius: 6, style: .continuous)
             .fill(Color.white.opacity(fillOpacity))
             .overlay(alignment: .topLeading) {
-                if let ft = focusedTmux, !isGhost {
+                if let r = readout, !isGhost {
                     let m = MirrorGestureConstants.handleSize + MirrorGestureConstants.tmuxReadoutHandleMargin
-                    TmuxTileReadout(
-                        text: ft.text,
-                        error: ft.error,
-                        maxWidth: size.width - m,
-                        maxHeight: size.height - m,
-                        onMoveBegin: onMoveBegin,
-                        onMoveChange: onMoveChange,
-                        onMoveEnd: onMoveEnd
-                    )
+                    let mw = size.width - m
+                    let mh = size.height - m
+                    switch r {
+                    case .tmux(let text, let err):
+                        TmuxTileReadout(
+                            text: text,
+                            error: err,
+                            maxWidth: mw,
+                            maxHeight: mh,
+                            onMoveBegin: onMoveBegin,
+                            onMoveChange: onMoveChange,
+                            onMoveEnd: onMoveEnd
+                        )
+                    case .screen(let data, let err):
+                        WindowStreamTileReadout(
+                            imageData: data,
+                            error: err,
+                            maxWidth: mw,
+                            maxHeight: mh,
+                            onMoveBegin: onMoveBegin,
+                            onMoveChange: onMoveChange,
+                            onMoveEnd: onMoveEnd
+                        )
+                    }
                 }
             }
             .overlay(
@@ -689,9 +827,9 @@ private struct WindowMirrorOverlayTile: View {
             .onTapGesture {
                 if !isGhost { onTap() }
             }
-        // `TwoFingerScrollTextView` implements 1-finger move over the readout; avoid a second `moveGesture` (double `moveChange`).
+        // `TwoFingerScrollTextView` and `WindowStreamTileReadout` implement 1-finger move; avoid a second `moveGesture`.
         Group {
-            if focusedTmux == nil {
+            if readout == nil {
                 tileFace.gesture(moveGesture)
             } else {
                 tileFace
@@ -743,6 +881,104 @@ private struct WindowMirrorOverlayTile: View {
                     onResizeEnd()
                 }
             }
+    }
+}
+
+// MARK: - iPad: switch mirrored Mac app (grid)
+
+private struct MirrorAppPickerOverlay: View {
+    let apps: [BridgeMirrorAppEntry]
+    let currentBundleId: String?
+    let onPick: (String) -> Void
+    let onDismiss: () -> Void
+
+    private var gridColumns: [GridItem] {
+        [GridItem(.adaptive(minimum: 100, maximum: 140), spacing: 12, alignment: .top)]
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.55)
+                .ignoresSafeArea()
+                .onTapGesture { onDismiss() }
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text("Mirror app")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                    Spacer()
+                    Button("Done", action: onDismiss)
+                        .foregroundStyle(.white)
+                }
+                if apps.isEmpty {
+                    Text("No apps listed yet — they appear when the Mac bridge sends the app list. Start an app on the Mac if the list is empty.")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.85))
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: gridColumns, alignment: .center, spacing: 14) {
+                            ForEach(apps) { app in
+                                Button {
+                                    onPick(app.bundleId)
+                                } label: {
+                                    VStack(spacing: 8) {
+                                        appIconView(app)
+                                            .frame(width: 56, height: 56)
+                                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                        Text(app.name)
+                                            .font(.caption)
+                                            .foregroundStyle(.white)
+                                            .lineLimit(2)
+                                            .multilineTextAlignment(.center)
+                                            .frame(minHeight: 32, alignment: .top)
+                                    }
+                                    .padding(10)
+                                    .frame(maxWidth: .infinity)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                            .fill(
+                                                isSelected(app)
+                                                ? Color.accentColor.opacity(0.4)
+                                                : Color.white.opacity(0.1)
+                                            )
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(22)
+            .frame(maxWidth: 520)
+        }
+    }
+
+    private func isSelected(_ app: BridgeMirrorAppEntry) -> Bool {
+        guard let c = currentBundleId else { return false }
+        return c == app.bundleId
+    }
+
+    @ViewBuilder
+    private func appIconView(_ app: BridgeMirrorAppEntry) -> some View {
+        if let b64 = app.iconPNGBase64,
+            let data = Data(base64Encoded: b64),
+            let ui = UIImage(data: data)
+        {
+            Image(uiImage: ui)
+                .resizable()
+                .scaledToFill()
+        } else {
+            Image(systemName: "app.fill")
+                .font(.title)
+                .foregroundStyle(.white.opacity(0.9))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.white.opacity(0.12))
+                )
+        }
     }
 }
 

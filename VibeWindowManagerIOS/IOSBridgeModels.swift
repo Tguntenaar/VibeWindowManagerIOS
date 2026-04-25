@@ -52,3 +52,26 @@ struct BridgeTmuxPaneMessage: Codable {
     /// True if server clipped (line/byte cap).
     var truncated: Bool
 }
+
+struct BridgeMirrorAppEntry: Codable, Equatable, Identifiable {
+    var name: String
+    var bundleId: String
+    var iconPNGBase64: String?
+
+    var id: String { bundleId }
+}
+
+struct BridgeMirrorAppListMessage: Codable, Equatable {
+    var type: String
+    var seq: UInt64
+    var apps: [BridgeMirrorAppEntry]
+}
+
+struct BridgeWindowStreamMessage: Codable, Equatable {
+    var type: String
+    var seq: UInt64
+    var windowId: String
+    var format: String
+    var base64: String?
+    var error: String?
+}
