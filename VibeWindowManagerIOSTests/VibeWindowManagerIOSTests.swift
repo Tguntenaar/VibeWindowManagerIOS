@@ -164,4 +164,24 @@ struct VibeWindowManagerIOSTests {
         // Sanity: 120 iPad points → some fraction of the full desktop width.
         #expect(dLeft.dx > 0 && dLeft.dx < 1)
     }
+
+    @Test func streamClickCalibrationAppliesAndClamps() {
+        let d = UserDefaults.standard
+        let kx = StreamClickCalibration.offsetNXKey
+        let ky = StreamClickCalibration.offsetNYKey
+        d.removeObject(forKey: kx)
+        d.removeObject(forKey: ky)
+        defer {
+            d.removeObject(forKey: kx)
+            d.removeObject(forKey: ky)
+        }
+        d.set(0.1, forKey: kx)
+        d.set(-0.05, forKey: ky)
+        let a = StreamClickCalibration.applyToNormalized(nx: 0.4, ny: 0.5)
+        #expect(abs(a.nx - 0.5) < 1e-9)
+        #expect(abs(a.ny - 0.45) < 1e-9)
+        let b = StreamClickCalibration.applyToNormalized(nx: 0.99, ny: 0.02)
+        #expect(abs(b.nx - 1) < 1e-9)
+        #expect(b.ny == 0)
+    }
 }

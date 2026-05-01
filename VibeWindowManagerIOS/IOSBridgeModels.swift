@@ -75,3 +75,13 @@ struct BridgeWindowStreamMessage: Codable, Equatable {
     var base64: String?
     var error: String?
 }
+
+struct BridgeCalibrationTargetMessage: Codable, Equatable {
+    var type: String
+    var windowId: String
+    var expectNx: Double
+    var expectNy: Double
+    var sampleCount: Int
+    /// Omitted on older Mac builds; treat as 0.
+    var sampleIndex: Int?
+}

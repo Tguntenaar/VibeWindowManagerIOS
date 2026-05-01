@@ -38,6 +38,8 @@ final class BridgeClient: ObservableObject {
     @Published var currentTarget: String?
     /// True after the first successful `layout` message; cleared on disconnect or connection loss.
     @Published private(set) var hasActiveLayoutSession = false
+    /// Mac sent `calibrationTarget`; user taps the live tile that many times with **raw** normalized coords.
+    @Published private(set) var streamClickCalibrationSession: StreamClickCalibrationSession?
     /// Persisted Tailnet hostname (e.g. `my-mac.tailxxxx.ts.net` or short `my-mac`) for the Connect via Tailnet field.
     @Published var preferredTailnetHost: String {
         didSet { UserDefaults.standard.set(preferredTailnetHost, forKey: Self.tailnetHostKey) }
@@ -130,6 +132,7 @@ final class BridgeClient: ObservableObject {
         transcribeInFlight = false
         transcribeLast = ""
         transcribeError = nil
+        streamClickCalibrationSession = nil
         status = manual ? "Disconnected" : "Not connected"
     }
 
@@ -426,6 +429,31 @@ final class BridgeClient: ObservableObject {
                     windowStreamErrorById[m.windowId] = e
                 }
             }
+        case "calibrationTarget":
+            if let m = try? decoder.decode(BridgeCalibrationTargetMessage.self, from: data) {
+                let n = max(1, m.sampleCount)
+                let si = m.sampleIndex ?? 0
+                if var s = streamClickCalibrationSession, s.targetWindowId == m.windowId {
+                    s.expectNx = m.expectNx
+                    s.expectNy = m.expectNy
+                    s.sampleCount = n
+                    s.awaitingReposition = false
+                    s.lastServerSampleIndex = si
+                    streamClickCalibrationSession = s
+                } else {
+                    streamClickCalibrationSession = StreamClickCalibrationSession(
+                        targetWindowId: m.windowId,
+                        expectNx: m.expectNx,
+                        expectNy: m.expectNy,
+                        sampleCount: n,
+                        perSample: [],
+                        awaitingReposition: false,
+                        lastServerSampleIndex: si
+                    )
+                    sendSelect(windowId: m.windowId)
+                }
+                noteAction("Stream calibration: dot \(si + 1)/\(n) — tap in the live tile")
+            }
         default:
             break
         }
@@ -451,6 +479,62 @@ final class BridgeClient: ObservableObject {
             windowStreamErrorById = [:]
         }
         sendEncodable(ClientSetWindowStreamEnabled(enabled: enabled))
+    }
+
+    /// Tap on the live JPEG: Mac raises the window and posts a left click at the mapped point (`nx`,`ny` are 0…1, top-left of bitmap). Applies `StreamClickCalibration` nudges.
+    func sendWindowStreamClick(windowId: String, nx: Double, ny: Double) {
+        let t = StreamClickCalibration.applyToNormalized(nx: nx, ny: ny)
+        // #region agent log
+        print("VWM_DEBUG iOS sendWindowStreamClick windowId=\(windowId) rawNx=\(nx) rawNy=\(ny) afterOffsetNx=\(t.nx) afterOffsetNy=\(t.ny) storedOff=\(StreamClickCalibration.offsetNX()) \(StreamClickCalibration.offsetNY())")
+        // #endregion
+        sendEncodable(ClientWindowStreamClick(windowId: windowId, nx: t.nx, ny: t.ny))
+    }
+
+    /// Unadjusted 0…1 (for moving the Mac calibration target without applying an offset you are measuring).
+    private func sendWindowStreamClickRawToMac(windowId: String, nx: Double, ny: Double) {
+        sendEncodable(ClientWindowStreamClick(windowId: windowId, nx: nx, ny: ny))
+    }
+
+    /// Asks the Mac to show the white dot calibration window. After `calibrationTarget` arrives, taps on that tile with **raw** coords are sampled until `sampleCount`.
+    func beginStreamClickCalibrationTapping() {
+        streamClickCalibrationSession = nil
+        sendEncodable(ClientOpenCalibration())
+        noteAction("Stream calibration: opening target on Mac…")
+    }
+
+    func cancelStreamClickCalibrationTapping() {
+        streamClickCalibrationSession = nil
+        sendEncodable(ClientCloseCalibration())
+        noteAction("Stream calibration: cancelled")
+    }
+
+    /// Entry point for live-tile short taps: multi-point calibration or a nudged click to the Mac.
+    func handleStreamClick(windowId: String, rawNx: Double, rawNy: Double) {
+        if var s = streamClickCalibrationSession, s.targetWindowId == windowId {
+            if s.awaitingReposition { return }
+            let ex = s.expectNx
+            let ey = s.expectNy
+            s.perSample.append((ex, ey, rawNx, rawNy))
+            if s.perSample.count < s.sampleCount {
+                s.awaitingReposition = true
+                streamClickCalibrationSession = s
+                // Tell the Mac to move the dot; it repushes a new `calibrationTarget` with the next expect.
+                sendWindowStreamClickRawToMac(windowId: windowId, nx: rawNx, ny: rawNy)
+            } else {
+                let n = Double(s.perSample.count)
+                let dnx = s.perSample.map { $0.0 - $0.2 }.reduce(0, +) / n
+                let dny = s.perSample.map { $0.1 - $0.3 }.reduce(0, +) / n
+                // #region agent log
+                print("VWM_DEBUG iOS calibration complete meanOffset dnx=\(dnx) dny=\(dny) samples=\(s.perSample.count)")
+                // #endregion
+                StreamClickCalibration.setOffsets(nx: dnx, ny: dny)
+                streamClickCalibrationSession = nil
+                sendEncodable(ClientCloseCalibration())
+                noteAction("Stream calibration: saved (mean offset over \(Int(n)) spots)")
+            }
+            return
+        }
+        sendWindowStreamClick(windowId: windowId, nx: rawNx, ny: rawNy)
     }
 
     func sendSetWindowRect(windowId: String, rect: BridgeRect) {
@@ -526,6 +610,7 @@ final class BridgeClient: ObservableObject {
         windowStreamErrorById = [:]
         windowStreamToMacIsOn = false
         hasActiveLayoutSession = false
+        streamClickCalibrationSession = nil
         tmuxPaneText = ""
         tmuxPaneError = nil
         tmuxPaneTruncated = false
@@ -610,6 +695,33 @@ struct ClientSetMirrorAppQuery: Encodable {
 struct ClientSetWindowStreamEnabled: Encodable {
     var type: String = "setWindowStreamEnabled"
     var enabled: Bool
+}
+
+struct ClientWindowStreamClick: Encodable {
+    var type: String = "windowStreamClick"
+    var windowId: String
+    var nx: Double
+    var ny: Double
+}
+
+struct ClientOpenCalibration: Encodable {
+    var type: String = "openCalibrationTarget"
+}
+
+struct ClientCloseCalibration: Encodable {
+    var type: String = "closeCalibrationTarget"
+}
+
+struct StreamClickCalibrationSession {
+    var targetWindowId: String
+    var expectNx: Double
+    var expectNy: Double
+    var sampleCount: Int
+    /// Paired (expected, raw) in normalized 0…1; used to check drift/linearity across the surface.
+    var perSample: [(Double, Double, Double, Double)]
+    /// Set after a tap until a new `calibrationTarget` arrives (Mac moved the dot).
+    var awaitingReposition: Bool
+    var lastServerSampleIndex: Int
 }
 
 extension BridgeClient {

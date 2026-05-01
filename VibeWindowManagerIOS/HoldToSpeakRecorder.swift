@@ -136,6 +136,10 @@ final class HoldToSpeakRecorder: ObservableObject {
         lastError = nil
         liveTranscript = ""
         guard !isRunning else { return }
+        guard TranscribeDevSettings.anyPathEnabled else {
+            lastError = "Both transcribe paths are off (Dev → Transcribe). Turn at least one on."
+            return
+        }
 
         AVAudioSession.sharedInstance().requestRecordPermission { [weak self] allowed in
             Task { @MainActor in
@@ -144,28 +148,34 @@ final class HoldToSpeakRecorder: ObservableObject {
                     self.lastError = "Microphone access denied. Enable in Settings."
                     return
                 }
-                SFSpeechRecognizer.requestAuthorization { [weak self] status in
-                    Task { @MainActor in
-                        guard let self else { return }
-                        do {
-                            try self.configureSession()
-                            try self.startEngine(bridge: bridge, speechAuth: status)
-                            self.isRunning = true
-                        } catch {
-                            self.tearDown()
-                            self.lastError = (error as NSError).localizedDescription
+                if TranscribeDevSettings.sfspeechTranscribeLiveEnabled() {
+                    SFSpeechRecognizer.requestAuthorization { [weak self] status in
+                        Task { @MainActor in
+                            guard let self else { return }
+                            self.startAfterPermission(bridge: bridge, speechAuth: status)
                         }
                     }
+                } else {
+                    self.startAfterPermission(bridge: bridge, speechAuth: .denied)
                 }
             }
         }
     }
 
+    private func startAfterPermission(bridge: BridgeClient, speechAuth: SFSpeechRecognizerAuthorizationStatus) {
+        do {
+            try configureSession()
+            try startEngine(bridge: bridge, speechAuth: speechAuth)
+            isRunning = true
+        } catch {
+            tearDown()
+            lastError = (error as NSError).localizedDescription
+        }
+    }
+
     func stop() {
         guard isRunning else { return }
-        // Send the last partial once so the Mac’s `lastMacLiveText` matches the buffer before
-        // `transcribe` end+Whisper (debounce may have dropped the last tick).
-        if let b = bridge, !liveTranscript.isEmpty {
+        if TranscribeDevSettings.sfspeechTranscribeLiveEnabled(), let b = bridge, !liveTranscript.isEmpty {
             b.sendTranscribeLive(text: liveTranscript)
         }
         liveMacDebounce?.cancel()
@@ -184,12 +194,16 @@ final class HoldToSpeakRecorder: ObservableObject {
         liveTranscript = ""
         engine?.stop()
         engine = nil
-        if let s = state, let tail = s.takePending(), !tail.isEmpty {
+        if TranscribeDevSettings.pcmMacWhisperEnabled(), let s = state, let tail = s.takePending(), !tail.isEmpty {
             bridge?.sendTranscribeChunk(base64: tail.base64EncodedString(), end: false)
+        } else {
+            state?.clear()
         }
         state = nil
         isRunning = false
-        bridge?.sendTranscribeChunk(base64: "", end: true)
+        if TranscribeDevSettings.pcmMacWhisperEnabled() {
+            bridge?.sendTranscribeChunk(base64: "", end: true)
+        }
     }
 
     // MARK: - Internals
@@ -202,26 +216,32 @@ final class HoldToSpeakRecorder: ObservableObject {
 
     private func startEngine(bridge: BridgeClient, speechAuth: SFSpeechRecognizerAuthorizationStatus) throws {
         self.bridge = bridge
+        let usePcm = TranscribeDevSettings.pcmMacWhisperEnabled()
+        let useLiveSpeech = TranscribeDevSettings.sfspeechTranscribeLiveEnabled() && speechAuth == .authorized
+
         let e = AVAudioEngine()
         let inNode = e.inputNode
         let fromFormat = inNode.outputFormat(forBus: 0)
-        guard let toFormat = Self.makePcmS16_16kMono() else {
-            throw NSError(
-                domain: "HoldToSpeak",
-                code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "16 kHz mono int16 format unavailable."]
-            )
+        var cap: CaptureState?
+        if usePcm {
+            guard let toFormat = Self.makePcmS16_16kMono() else {
+                throw NSError(
+                    domain: "HoldToSpeak",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "16 kHz mono int16 format unavailable."]
+                )
+            }
+            guard let conv = AVAudioConverter(from: fromFormat, to: toFormat) else {
+                throw NSError(
+                    domain: "HoldToSpeak",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Could not build audio resampler (mic format unsupported)."]
+                )
+            }
+            cap = CaptureState(converter: conv, fromFormat: fromFormat, toFormat: toFormat)
         }
-        guard let conv = AVAudioConverter(from: fromFormat, to: toFormat) else {
-            throw NSError(
-                domain: "HoldToSpeak",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Could not build audio resampler (mic format unsupported)."]
-            )
-        }
-        let cap = CaptureState(converter: conv, fromFormat: fromFormat, toFormat: toFormat)
         var fwd: SpeechBufferForwarder?
-        if speechAuth == .authorized {
+        if useLiveSpeech {
             // Pin to the device locale so non‑English (e.g. Dutch) can get live partials from the
             // correct on-device model instead of falling through to a default recognizer only.
             let rec: SFSpeechRecognizer? = {
@@ -261,8 +281,8 @@ final class HoldToSpeakRecorder: ObservableObject {
             self.speechRecognizer = nil
         }
         inNode.removeTap(onBus: 0)
-        inNode.installTap(onBus: 0, bufferSize: 4096, format: fromFormat) { [cap, fwd] buffer, _ in
-            cap.ingest(buffer: buffer)
+        inNode.installTap(onBus: 0, bufferSize: 4096, format: fromFormat) { buffer, _ in
+            cap?.ingest(buffer: buffer)
             fwd?.append(buffer)
         }
         e.prepare()
@@ -273,7 +293,7 @@ final class HoldToSpeakRecorder: ObservableObject {
             speechTask?.cancel()
             speechTask = nil
             speechRecognizer = nil
-            if let fwd = speechForwarder, let req = fwd.takeForEnd() {
+            if let fwd2 = speechForwarder, let req = fwd2.takeForEnd() {
                 req.endAudio()
             }
             speechForwarder = nil
@@ -281,21 +301,24 @@ final class HoldToSpeakRecorder: ObservableObject {
         }
         engine = e
         state = cap
-        chunkTimer = Timer.scheduledTimer(withTimeInterval: Self.chunkInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.flushTick()
+        if usePcm {
+            chunkTimer = Timer.scheduledTimer(withTimeInterval: Self.chunkInterval, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    self?.flushTick()
+                }
             }
         }
     }
 
     private func flushTick() {
-        guard let s = state else { return }
+        guard TranscribeDevSettings.pcmMacWhisperEnabled(), let s = state else { return }
         if let d = s.takePending(), !d.isEmpty {
             bridge?.sendTranscribeChunk(base64: d.base64EncodedString(), end: false)
         }
     }
 
     private func debounceSendTranscribeLive(bridge: BridgeClient, text: String) {
+        guard TranscribeDevSettings.sfspeechTranscribeLiveEnabled() else { return }
         liveMacSendPending = text
         liveMacDebounce?.cancel()
         liveMacDebounce = Task { @MainActor in

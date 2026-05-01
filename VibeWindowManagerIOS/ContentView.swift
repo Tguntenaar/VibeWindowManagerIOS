@@ -21,6 +21,11 @@ struct ContentView: View {
     @State private var showingBridgeSettings = false
     @State private var showingTmuxPane = false
     @State private var showingMirrorAppPicker = false
+    @State private var showingStreamCalibration = false
+    @State private var showingRemoteLayout = false
+    #if DEBUG
+    @State private var showingTranscribeDev = false
+    #endif
 
     /// Local preview rects during drag/resize; cleared when server sends a new `layout.seq` (unless manipulating).
     @State private var gestureDraft: [String: BridgeRect] = [:]
@@ -111,6 +116,16 @@ struct ContentView: View {
                         }
                         .accessibilityLabel("Tmux buffer (full scrollback sheet)")
                         Button {
+                            showingRemoteLayout = true
+                        } label: {
+                            Image(systemName: "rectangle.split.2x1")
+                                .font(.title2)
+                                .foregroundStyle(.white.opacity(0.85))
+                                .padding(12)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("Arrange windows (layouts)")
+                        Button {
                             showingBridgeSettings = true
                         } label: {
                             Image(systemName: "gearshape.fill")
@@ -120,6 +135,28 @@ struct ContentView: View {
                                 .contentShape(Rectangle())
                         }
                         .accessibilityLabel("Bridge settings")
+                        Button {
+                            showingStreamCalibration = true
+                        } label: {
+                            Image(systemName: "viewfinder")
+                                .font(.title2)
+                                .foregroundStyle(.white.opacity(0.85))
+                                .padding(12)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("Calibrate stream clicks")
+                        #if DEBUG
+                        Button {
+                            showingTranscribeDev = true
+                        } label: {
+                            Image(systemName: "ladybug.fill")
+                                .font(.title2)
+                                .foregroundStyle(.white.opacity(0.85))
+                                .padding(12)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("Transcribe dev settings")
+                        #endif
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
@@ -162,6 +199,17 @@ struct ContentView: View {
         .sheet(isPresented: $showingTmuxPane) {
             tmuxPaneSheet
         }
+        .sheet(isPresented: $showingStreamCalibration) {
+            StreamClickCalibrationView(bridge: bridge)
+        }
+        .sheet(isPresented: $showingRemoteLayout) {
+            RemoteLayoutPanel(bridge: bridge)
+        }
+        #if DEBUG
+        .sheet(isPresented: $showingTranscribeDev) {
+            TranscribeDevSettingsView()
+        }
+        #endif
         .overlay {
             if showingMirrorAppPicker, isMirroring {
                 MirrorAppPickerOverlay(
@@ -283,6 +331,9 @@ struct ContentView: View {
                         map: vmap,
                         readout: tileReadout(layout: L, for: win),
                         onTap: { bridge.sendSelect(windowId: win.id) },
+                        onStreamClick: { nx, ny in
+                            bridge.handleStreamClick(windowId: win.id, rawNx: nx, rawNy: ny)
+                        },
                         onMoveBegin: { beginMove(windowId: win.id, map: vmap, source: source) },
                         onMoveChange: { dx, dy in moveChange(windowId: win.id, dxPt: dx, dyPt: dy) },
                         onMoveEnd: { endMove(windowId: win.id) },
@@ -595,64 +646,146 @@ enum MirrorGestureConstants {
     static let moveMinDistance: CGFloat = 6
     /// Inset from tile edges for the in-tile tmux readout, leaving the resize handle (bottom-trailing) clear.
     static let tmuxReadoutHandleMargin: CGFloat = 10
+    /// Smaller, fainter than `handleSize`; floats over full-bleed screen capture.
+    static let subtleResizeHandleSize: CGFloat = 16
 }
 
-/// Live Mac window image (VNC-style over the bridge). One-finger move matches tile drag (global coords).
+/// Map a `scaledToFill` tap to 0…1 in the **source** image, top-left (Mac uses this for `windowStreamClick`).
+private enum WindowStreamTapInImage {
+    static func topLeftNorm(
+        localPoint: CGPoint,
+        viewW: CGFloat,
+        viewH: CGFloat,
+        imageW: CGFloat,
+        imageH: CGFloat
+    ) -> (Double, Double) {
+        guard viewW > 0, viewH > 0, imageW > 0, imageH > 0 else { return (0, 0) }
+        let s = max(viewW / imageW, viewH / imageH)
+        let visW = viewW / s
+        let visH = viewH / s
+        let left = (imageW - visW) * 0.5
+        let top = (imageH - visH) * 0.5
+        var ix = left + localPoint.x / s
+        var iy = top + localPoint.y / s
+        ix = min(imageW, max(0, ix))
+        iy = min(imageH, max(0, iy))
+        return (Double(ix / imageW), Double(iy / imageH))
+    }
+}
+
+/// Live Mac window JPEG (custom bridge, not RFB/VNC). Full-bleed, no extra chrome.
+/// - **Short tap** with a loaded image → `onStreamClick(nx,ny)`; otherwise `onSelect` (focus for STT / paste only).
+/// - **Drag** past threshold → move window.
 private struct WindowStreamTileReadout: View {
     var imageData: Data?
     var error: String?
     var maxWidth: CGFloat
     var maxHeight: CGFloat
+    var cornerRadius: CGFloat
+    var onSelect: () -> Void
+    var onStreamClick: (Double, Double) -> Void
     var onMoveBegin: () -> Void
     var onMoveChange: (CGFloat, CGFloat) -> Void
     var onMoveEnd: () -> Void
 
     @State private var didBeginMove = false
+    @State private var lastImageSize: CGSize = .zero
+    @State private var rippleLocal: CGPoint?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            if let e = error, !e.isEmpty {
-                Text(e)
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(.red)
-                    .lineLimit(3)
-            }
-            ZStack {
-                Color.black
+        ZStack(alignment: .top) {
+            Group {
                 if let d = imageData, let img = UIImage(data: d) {
                     Image(uiImage: img)
                         .resizable()
-                        .scaledToFit()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .scaledToFill()
+                        .frame(width: maxWidth, height: maxHeight)
+                        .clipped()
                 } else {
                     Text(
                         "Waiting for live screen…\n(Grant Screen Recording to VibeWindowManager on the Mac if prompted.)"
                     )
                     .font(.system(size: 9, weight: .regular))
-                    .foregroundStyle(Color.white.opacity(0.5))
+                    .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                    .padding(6)
+                    .frame(width: maxWidth, height: maxHeight)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(white: 0.12))
                 }
             }
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .onChange(of: imageData) { _, new in
+                if let d = new, let img = UIImage(data: d) {
+                    lastImageSize = img.size
+                } else {
+                    lastImageSize = .zero
+                }
+            }
+
+            if let e = error, !e.isEmpty {
+                Text(e)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.red)
+                    .lineLimit(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(5)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                    .padding(5)
+            }
+
+            if let p = rippleLocal {
+                Circle()
+                    .strokeBorder(Color.cyan.opacity(0.9), lineWidth: 2)
+                    .frame(width: 40, height: 40)
+                    .position(p)
+                    .allowsHitTesting(false)
+            }
         }
-        .padding(4)
         .frame(width: maxWidth, height: maxHeight, alignment: .topLeading)
-        .background(Color.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
-        .contentShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .onAppear {
+            if let d = imageData, let img = UIImage(data: d) { lastImageSize = img.size }
+        }
         .highPriorityGesture(
-            DragGesture(minimumDistance: MirrorGestureConstants.moveMinDistance, coordinateSpace: .global)
+            DragGesture(minimumDistance: 0, coordinateSpace: .local)
                 .onChanged { drag in
+                    let h = hypot(drag.translation.width, drag.translation.height)
+                    if h < MirrorGestureConstants.moveMinDistance { return }
                     if !didBeginMove {
                         didBeginMove = true
                         onMoveBegin()
                     }
                     onMoveChange(drag.translation.width, drag.translation.height)
                 }
-                .onEnded { _ in
-                    if didBeginMove {
-                        didBeginMove = false
+                .onEnded { drag in
+                    let h = hypot(drag.translation.width, drag.translation.height)
+                    if !didBeginMove {
+                        let imageSize: CGSize = {
+                            if lastImageSize.width > 0, lastImageSize.height > 0 { return lastImageSize }
+                            if let d = imageData, let im = UIImage(data: d) { return im.size }
+                            return .zero
+                        }()
+                        if imageSize.width > 0, imageSize.height > 0 {
+                            let p = drag.location
+                            let (nx, ny) = WindowStreamTapInImage.topLeftNorm(
+                                localPoint: p,
+                                viewW: maxWidth,
+                                viewH: maxHeight,
+                                imageW: imageSize.width,
+                                imageH: imageSize.height
+                            )
+                            rippleLocal = p
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                                rippleLocal = nil
+                            }
+                            onStreamClick(nx, ny)
+                        } else {
+                            onSelect()
+                        }
+                    } else {
                         onMoveEnd()
                     }
+                    didBeginMove = false
                 }
         )
     }
@@ -729,6 +862,7 @@ private struct MirrorGlobalMicButton: View {
         .frame(width: MirrorGestureConstants.globalMicButtonSize, height: MirrorGestureConstants.globalMicButtonSize)
         .contentShape(Circle())
         .accessibilityLabel("Hold to speak to selected window")
+        .accessibilityHint("Tap a window tile first to choose where the Mac will type after speech.")
         .highPriorityGesture(
             DragGesture(minimumDistance: 0, coordinateSpace: .local)
                 .onChanged { _ in
@@ -757,6 +891,7 @@ private struct WindowMirrorOverlayTile: View {
     let map: MirrorViewportMap
     let readout: MirrorTileReadout?
     var onTap: () -> Void
+    var onStreamClick: (Double, Double) -> Void
     var onMoveBegin: () -> Void
     var onMoveChange: (CGFloat, CGFloat) -> Void
     var onMoveEnd: () -> Void
@@ -769,22 +904,43 @@ private struct WindowMirrorOverlayTile: View {
 
     var body: some View {
         let (center, size) = map.centerAndSize(for: effectiveRect)
-        let baseFill: Double = selected ? 0.36 : 0.10
-        let fillOpacity: Double = isGhost ? 0.18 : baseFill
+        let isScreenStream: Bool = {
+            guard let r = readout else { return false }
+            if case .screen = r { return true }
+            return false
+        }()
+
+        let m = MirrorGestureConstants.handleSize + MirrorGestureConstants.tmuxReadoutHandleMargin
+        let mw: CGFloat = (isScreenStream && !isGhost) ? size.width : size.width - m
+        let mh: CGFloat = (isScreenStream && !isGhost) ? size.height : size.height - m
+
+        let tileFill: Color = {
+            if isGhost { return Color.white.opacity(0.18) }
+            if isScreenStream, !isGhost { return .clear }
+            return Color.white.opacity(selected ? 0.36 : 0.10)
+        }()
+        let strokeW: CGFloat = {
+            if isGhost { return 2 }
+            if isScreenStream, !isGhost { return selected ? 0.75 : 0.5 }
+            return selected ? 2.5 : 1
+        }()
         let strokeStyle: StrokeStyle = isGhost
             ? StrokeStyle(lineWidth: 2, dash: [6, 4])
-            : StrokeStyle(lineWidth: selected ? 2.5 : 1)
-        let strokeColor: Color = isGhost
-            ? Color.white.opacity(0.9)
-            : Color.white.opacity(selected ? 1 : 0.75)
+            : StrokeStyle(lineWidth: strokeW)
+        let strokeColor: Color = {
+            if isGhost { return Color.white.opacity(0.9) }
+            if isScreenStream, !isGhost {
+                return Color.white.opacity(selected ? 0.38 : 0.2)
+            }
+            return Color.white.opacity(selected ? 1.0 : 0.75)
+        }()
 
-        let tileFace = RoundedRectangle(cornerRadius: 6, style: .continuous)
-            .fill(Color.white.opacity(fillOpacity))
+        // Live JPEG tiles: never attach a parent `onTapGesture` — it wins over the stream child’s
+        // `DragGesture` on many iOS builds, so `onStreamClick` (cursor injection) never fires.
+        let baseFace: some View = RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .fill(tileFill)
             .overlay(alignment: .topLeading) {
                 if let r = readout, !isGhost {
-                    let m = MirrorGestureConstants.handleSize + MirrorGestureConstants.tmuxReadoutHandleMargin
-                    let mw = size.width - m
-                    let mh = size.height - m
                     switch r {
                     case .tmux(let text, let err):
                         TmuxTileReadout(
@@ -802,6 +958,9 @@ private struct WindowMirrorOverlayTile: View {
                             error: err,
                             maxWidth: mw,
                             maxHeight: mh,
+                            cornerRadius: 6,
+                            onSelect: onTap,
+                            onStreamClick: onStreamClick,
                             onMoveBegin: onMoveBegin,
                             onMoveChange: onMoveChange,
                             onMoveEnd: onMoveEnd
@@ -815,18 +974,24 @@ private struct WindowMirrorOverlayTile: View {
             )
             .overlay(alignment: .bottomTrailing) {
                 if !isGhost {
-                    resizeHandle
-                        .frame(width: MirrorGestureConstants.handleSize, height: MirrorGestureConstants.handleSize)
+                    subtleResizeHandle
                         .contentShape(Circle())
                         .highPriorityGesture(resizeGesture)
-                        .padding(4)
+                        .offset(x: 2, y: 2)
                 }
             }
             .frame(width: size.width, height: size.height)
             .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-            .onTapGesture {
-                if !isGhost { onTap() }
+        let tileFace = Group {
+            if case .some(.screen(_, _)) = readout {
+                baseFace
+            } else {
+                baseFace
+                    .onTapGesture {
+                        if !isGhost { onTap() }
+                    }
             }
+        }
         // `TwoFingerScrollTextView` and `WindowStreamTileReadout` implement 1-finger move; avoid a second `moveGesture`.
         Group {
             if readout == nil {
@@ -839,10 +1004,18 @@ private struct WindowMirrorOverlayTile: View {
         .allowsHitTesting(!isGhost)
     }
 
-    private var resizeHandle: some View {
+    /// Low-contrast, sits on the tile corner; image extends underneath when using screen stream.
+    private var subtleResizeHandle: some View {
         Circle()
-            .fill(Color.white.opacity(0.55))
-            .overlay(Circle().stroke(Color.white.opacity(0.9), lineWidth: 1))
+            .fill(Color.white.opacity(0.1))
+            .overlay(
+                Circle()
+                    .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.75)
+            )
+            .frame(
+                width: MirrorGestureConstants.subtleResizeHandleSize,
+                height: MirrorGestureConstants.subtleResizeHandleSize
+            )
     }
 
     // Gestures run in `.global` so `translation` is measured in stable iPad-screen coordinates.
@@ -892,10 +1065,6 @@ private struct MirrorAppPickerOverlay: View {
     let onPick: (String) -> Void
     let onDismiss: () -> Void
 
-    private var gridColumns: [GridItem] {
-        [GridItem(.adaptive(minimum: 100, maximum: 140), spacing: 12, alignment: .top)]
-    }
-
     var body: some View {
         ZStack {
             Color.black.opacity(0.55)
@@ -910,74 +1079,15 @@ private struct MirrorAppPickerOverlay: View {
                     Button("Done", action: onDismiss)
                         .foregroundStyle(.white)
                 }
-                if apps.isEmpty {
-                    Text("No apps listed yet — they appear when the Mac bridge sends the app list. Start an app on the Mac if the list is empty.")
-                        .font(.subheadline)
-                        .foregroundStyle(.white.opacity(0.85))
-                        .fixedSize(horizontal: false, vertical: true)
-                } else {
-                    ScrollView {
-                        LazyVGrid(columns: gridColumns, alignment: .center, spacing: 14) {
-                            ForEach(apps) { app in
-                                Button {
-                                    onPick(app.bundleId)
-                                } label: {
-                                    VStack(spacing: 8) {
-                                        appIconView(app)
-                                            .frame(width: 56, height: 56)
-                                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                                        Text(app.name)
-                                            .font(.caption)
-                                            .foregroundStyle(.white)
-                                            .lineLimit(2)
-                                            .multilineTextAlignment(.center)
-                                            .frame(minHeight: 32, alignment: .top)
-                                    }
-                                    .padding(10)
-                                    .frame(maxWidth: .infinity)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                            .fill(
-                                                isSelected(app)
-                                                ? Color.accentColor.opacity(0.4)
-                                                : Color.white.opacity(0.1)
-                                            )
-                                    )
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                    }
-                }
+                MirrorAppPickerGrid(
+                    apps: apps,
+                    currentBundleId: currentBundleId,
+                    onPick: onPick,
+                    style: .overlayDark
+                )
             }
             .padding(22)
             .frame(maxWidth: 520)
-        }
-    }
-
-    private func isSelected(_ app: BridgeMirrorAppEntry) -> Bool {
-        guard let c = currentBundleId else { return false }
-        return c == app.bundleId
-    }
-
-    @ViewBuilder
-    private func appIconView(_ app: BridgeMirrorAppEntry) -> some View {
-        if let b64 = app.iconPNGBase64,
-            let data = Data(base64Encoded: b64),
-            let ui = UIImage(data: data)
-        {
-            Image(uiImage: ui)
-                .resizable()
-                .scaledToFill()
-        } else {
-            Image(systemName: "app.fill")
-                .font(.title)
-                .foregroundStyle(.white.opacity(0.9))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.white.opacity(0.12))
-                )
         }
     }
 }
